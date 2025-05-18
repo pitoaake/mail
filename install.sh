@@ -270,7 +270,7 @@ echo " PMail配置完成"
 
 echo -e "\n\033[33m停止并删除PMail服务...\033[0m"
 # docker system prune -af
-docker compose down || docker-compose down
+docker-compose down || docker compose down
 
 docker ps -aq | xargs -r docker rm -f
 docker ps -a
@@ -279,7 +279,7 @@ netstat -anpto | grep 25
 
 echo -e "\n\033[36m安装并启动PMail服务...\033[0m"
 # 启动服务（增加错误检测）
-if docker compose up -d || docker-compose up -d; then
+if docker-compose up -d || docker compose up -d; then
     echo -e "\033[33mPMail启动成功！\033[0m"
 else
     echo -e "\033[31mPMail启动失败，请检查日志\033[0m" >&2
