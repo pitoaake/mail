@@ -163,8 +163,7 @@ install_docker_compose() {
             echo "下载失败，尝试下一个镜像源..."
             rm -f "$INSTALL_PATH" 2>/dev/null
             sleep 2
-        fi
-    done
+        done
     
     # 检查是否下载成功
     if [ ! -f "$INSTALL_PATH" ]; then
