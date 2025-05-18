@@ -64,7 +64,7 @@ install_docker() {
 
     # 多源安装Docker
     local docker_install_cmds=(
-        "curl -fsSL https://get.docker.com | sh -"
+        "curl -fsSL https://get.docker.com | sh"
         "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg"
         "echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable\" | tee /etc/apt/sources.list.d/docker.list > /dev/null"
     )
@@ -76,7 +76,7 @@ install_docker() {
         else
             echo -e "${YELLOW}⚠ 安装命令失败，尝试备用方案...${NC}"
             sleep 2
-        done
+        fi
     done
 
     # 启动服务
