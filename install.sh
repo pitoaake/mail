@@ -6,7 +6,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# 参数校验（新增第4个parse参数）
+# 参数校验
 if [[ $# -lt 5 ]]; then
     echo -e "\033[31m错误：缺少必要参数\033[0m"
     echo "用法: install.sh <IP地址> <域名> <密码> <ACCECSS_KEY> <ACCECSS_SECRET>"
@@ -143,13 +143,38 @@ check_docker_compose() {
 install_docker_compose() {
     echo "开始安装Docker Compose..."
     COMPOSE_VERSION="v2.20.5"
+    BINARY_NAME="docker-compose-$(uname -s)-$(uname -m)"
+    INSTALL_PATH="/usr/local/bin/docker-compose"
     
-    # 使用国内镜像加速下载
-    curl -sSL "https://ghproxy.com/https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" \
-        -o /usr/local/bin/docker-compose
+    # 定义多个下载源（包括官方和国内镜像）
+    MIRROR_URLS=(
+        "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/${BINARY_NAME}"
+        "https://mirror.ghproxy.com/https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/${BINARY_NAME}"
+        "https://download.fastgit.org/docker/compose/releases/download/${COMPOSE_VERSION}/${BINARY_NAME}"
+    )
     
-    chmod +x /usr/local/bin/docker-compose
-    ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+    # 尝试从多个源下载
+    for url in "${MIRROR_URLS[@]}"; do
+        echo "尝试从 $url 下载..."
+        if curl -sSL "$url" -o "$INSTALL_PATH" --connect-timeout 30; then
+            echo "下载成功"
+            break
+        else
+            echo "下载失败，尝试下一个镜像源..."
+            rm -f "$INSTALL_PATH" 2>/dev/null
+            sleep 2
+        fi
+    done
+    
+    # 检查是否下载成功
+    if [ ! -f "$INSTALL_PATH" ]; then
+        echo -e "\033[31m ✘ 无法从任何镜像源下载 Docker Compose\033[0m" >&2
+        exit 1
+    fi
+    
+    # 设置权限
+    chmod +x "$INSTALL_PATH"
+    ln -sf "$INSTALL_PATH" /usr/bin/docker-compose
     
     # 验证安装
     if docker-compose --version &>/dev/null; then
@@ -191,20 +216,21 @@ check_and_install_jq() {
 }
 
 ##################################################
+# 主安装流程
 if check_docker_installed; then
     echo " 跳过安装步骤，直接使用现有Docker环境"
 else
     install_docker
     post_install
 fi
-##################################################
+
 if check_docker_compose; then
     echo " 跳过安装步骤，开始配置环境..."
 else
     install_docker_compose
 fi
 
-# 强制刷新用户组（解决需要重新登录的问题）
+# 强制刷新用户组
 if grep -q docker /etc/group; then
     echo -e "\033[33m 正在激活docker组权限...\033[0m"
     newgrp docker <<EOF
@@ -234,7 +260,6 @@ else
           --access-key-id $ACCECSS_KEY \
           --access-key-secret $ACCECSS_SECRET \
           --region $CLOUD_REGION
-          
     else
         echo -e "\033[31m ✘ Aliyun CLI安装失败\033[0m" >&2
         exit 1
@@ -260,11 +285,11 @@ services:
     ports:
       - "25:25"                # SMTP标准端口
       - "465:465"              # SMTPS加密端口
-      - "80:80"              # Web管理界面[3](@ref)
-      - "443:443"             # HTTPS访问端口
+      - "80:80"                # Web管理界面
+      - "443:443"              # HTTPS访问端口
       - "995:995"
       - "993:993"
-    restart: unless-stopped    # 异常退出自动重启[7](@ref)
+    restart: unless-stopped    # 异常退出自动重启
 EOF
 echo " PMail配置完成"
 
@@ -439,3 +464,5 @@ fetch_and_process_json "SSL配置..." $PMAIL_IP '{"action":"set","step":"ssl","s
 
 echo -e "\n\033[36m设置hostname\033[0m"
 hostnamectl set-hostname smtp.$DOMAIN
+
+echo -e "\n\033[32m[安装完成] PMail 已成功安装并配置\033[0m"
