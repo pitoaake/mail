@@ -1,35 +1,43 @@
 #!/usr/bin/env bash
-# PMail 自动化安装脚本 (优化版)
-# 版本: 2.1.0
-# 最后更新: 2023-11-20
+# PMail 自动化安装脚本 (终极优化版)
+# 版本: 3.0.0
+# 最后更新: 2023-11-21
 
 # ==================== 初始化配置 ====================
 set -eo pipefail
 shopt -s inherit_errexit
 LC_ALL=C
+trap 'handle_errors $LINENO' ERR
 
 # ==================== 常量定义 ====================
-readonly RED='\033[31m'
-readonly GREEN='\033[32m'
-readonly YELLOW='\033[33m'
-readonly BLUE='\033[36m'
-readonly NC='\033[0m'
+readonly RED='\033[31m' GREEN='\033[32m' YELLOW='\033[33m' BLUE='\033[36m' NC='\033[0m'
 readonly PMAIL_DIR="${PMAIL_DIR:-$HOME/pmail}"
 readonly CONFIG_DIR="$PMAIL_DIR/config"
 readonly SSL_DIR="$PMAIL_DIR/ssl"
-readonly LOG_FILE="/var/log/pmail_install.log"
-readonly DOCKER_COMPOSE_VERSION="2.24.7"
+readonly LOG_FILE="/var/log/pmail_install_$(date +%Y%m%d).log"
+readonly DOCKER_COMPOSE_VERSION="v2.24.7"
 readonly ALIYUN_CLI_VERSION="3.0.277"
 readonly REQUIRED_PORTS=(25 80 443 465 993 995)
+readonly REQUIRED_DNS_RECORDS=8
+readonly DNS_WAIT_TIME=90
 
-# ==================== 函数定义 ====================
+# ==================== 错误处理 ====================
+handle_errors() {
+    local line=$1
+    log "ERROR" "脚本异常退出 (行号: $line)"
+    log "ERROR" "最后错误: $?"
+    show_footer "安装失败"
+    exit 1
+}
 
-# 带颜色输出到控制台和日志文件
+# ==================== 日志函数 ====================
+init_log() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+    echo -e "=== PMail 安装日志 ===\n日期: $(date)\n版本: 3.0.0" > "$LOG_FILE"
+}
+
 log() {
-    local level=$1
-    local message=$2
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    
+    local level=$1 msg=$2 timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     case $level in
         "INFO") color=$GREEN ;;
         "WARN") color=$YELLOW ;;
@@ -37,114 +45,112 @@ log() {
         "DEBUG") color=$BLUE ;;
         *) color=$NC ;;
     esac
+    echo -e "${color}[${timestamp}] ${msg}${NC}" | tee -a "$LOG_FILE"
+}
+
+# ==================== 系统检查 ====================
+check_root() {
+    [[ $EUID -ne 0 ]] && log "ERROR" "必须使用root权限运行" && exit 1
+}
+
+check_os() {
+    [[ -f /etc/os-release ]] || {
+        log "ERROR" "不支持的操作系统"
+        exit 1
+    }
+    source /etc/os-release
+    [[ "$ID" =~ ^(ubuntu|debian|centos)$ ]] || {
+        log "ERROR" "不支持的操作系统: $ID"
+        exit 1
+    }
+}
+
+# ==================== 依赖安装 ====================
+install_dependencies() {
+    log "INFO" "开始安装系统依赖..."
     
-    echo -e "${color}[${timestamp}] ${message}${NC}"
-    echo "[${timestamp}] [$level] ${message}" >> "$LOG_FILE"
+    # 根据系统类型安装
+    case $(grep -oP '(?<=^ID=).+' /etc/os-release) in
+        ubuntu|debian)
+            debian_install ;;
+        centos)
+            centos_install ;;
+        *)
+            log "ERROR" "不支持的操作系统"
+            exit 1 ;;
+    esac
+
+    # 验证安装
+    command_exists docker || {
+        log "ERROR" "Docker安装失败"
+        exit 1
+    }
+    systemctl enable --now docker >/dev/null 2>&1
+    log "INFO" "系统依赖安装完成"
 }
 
-# 检查命令是否存在
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
+debian_install() {
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        curl wget jq lsof git ca-certificates gnupg apt-transport-https >/dev/null
+
+    # Docker官方安装
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null
 }
 
-# 检查端口占用
-check_port() {
-    local port=$1
-    if lsof -i :"$port" >/dev/null 2>&1; then
-        log "ERROR" "端口 $port 被占用: $(lsof -i :$port | awk 'NR==2{print $1}')"
-        return 1
-    fi
+centos_install() {
+    yum install -y yum-utils
+    yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+    yum install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 }
 
-# 清理旧环境
+# ==================== 环境清理 ====================
 clean_environment() {
     log "INFO" "开始清理旧环境..."
     
     # 停止并删除容器
-    if docker ps -a --filter "name=pmail" | grep -q pmail; then
-        log "DEBUG" "删除旧容器..."
-        docker rm -f pmail >/dev/null || {
-            log "WARN" "删除容器失败，尝试强制删除..."
-            docker rm -f pmail &>/dev/null || true
-        }
-    fi
-
-    # 删除网络
-    if docker network ls | grep -q pmail_default; then
-        log "DEBUG" "删除Docker网络..."
-        docker network rm pmail_default >/dev/null || true
-    fi
-
-    # 清理数据目录
-    if [[ -d "$PMAIL_DIR" ]]; then
-        log "DEBUG" "删除数据目录..."
-        find "$PMAIL_DIR" -mindepth 1 -delete || {
-            log "WARN" "部分文件删除失败，尝试强制删除..."
-            rm -rf "${PMAIL_DIR:?}"/* 2>/dev/null || true
-        }
-    fi
+    docker rm -f pmail &>/dev/null || true
+    
+    # 删除网络和卷
+    docker network rm pmail_default &>/dev/null || true
+    docker volume prune -f &>/dev/null || true
+    
+    # 清理目录
+    [[ -d "$PMAIL_DIR" ]] && {
+        find "$PMAIL_DIR" -mindepth 1 -delete 2>/dev/null || true
+    }
     
     log "INFO" "环境清理完成"
 }
 
-# 安装系统依赖
-install_dependencies() {
-    log "INFO" "开始安装系统依赖..."
+# ==================== 端口检查 ====================
+check_ports() {
+    log "INFO" "检查端口占用情况..."
+    local conflict=0
     
-    local pkgs=(
-        "curl" "wget" "jq" "lsof" "git"
-        "docker-ce" "docker-ce-cli" "containerd.io"
-    )
+    for port in "${REQUIRED_PORTS[@]}"; do
+        if lsof -i :"$port" >/dev/null; then
+            log "ERROR" "端口 $port 被占用: $(lsof -i :$port | awk 'NR==2{print $1}')"
+            conflict=1
+        fi
+    done
     
-    # 配置Docker源
-    if ! command_exists docker; then
-        log "DEBUG" "配置Docker官方源..."
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
-    fi
-    
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" >/dev/null
-    
-    # 启动Docker服务
-    systemctl enable --now docker >/dev/null 2>&1
-    
-    # 安装Docker Compose
-    if ! command_exists docker-compose; then
-        log "DEBUG" "安装Docker Compose..."
-        curl -L "https://github.com/docker/compose/releases/download/v$DOCKER_COMPOSE_VERSION/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-        chmod +x /usr/local/bin/docker-compose
-        ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose
-    fi
-    
-    log "INFO" "系统依赖安装完成"
+    [[ $conflict -eq 1 ]] && {
+        log "ERROR" "请释放被占用的端口或修改配置"
+        exit 1
+    }
+    log "INFO" "所有端口可用"
 }
 
-# 配置阿里云CLI
-setup_aliyun_cli() {
-    log "INFO" "配置阿里云CLI..."
-    
-    if ! command_exists aliyun; then
-        log "DEBUG" "安装阿里云CLI..."
-        curl -fsSL "https://aliyuncli.alicdn.com/aliyun-cli-linux-$ALIYUN_CLI_VERSION-amd64.tgz" | \
-            tar xz -C /usr/local/bin && chmod +x /usr/local/bin/aliyun
-    fi
-    
-    aliyun configure set \
-        --profile PMailInstaller \
-        --mode AK \
-        --access-key-id "$ACCESS_KEY" \
-        --access-key-secret "$ACCESS_SECRET" \
-        --region cn-hangzhou >/dev/null 2>&1
-    
-    log "INFO" "阿里云CLI配置完成"
-}
-
-# 部署PMail服务
+# ==================== PMail部署 ====================
 deploy_pmail() {
     log "INFO" "开始部署PMail服务..."
     
-    # 创建目录结构
     mkdir -p "$CONFIG_DIR" "$SSL_DIR"
     cd "$PMAIL_DIR"
     
@@ -173,71 +179,99 @@ services:
       - ./ssl:/work/ssl
 EOF
 
-    # 拉取镜像
-    log "DEBUG" "拉取PMail镜像..."
-    docker pull ghcr.io/jinnrry/pmail:latest >/dev/null 2>&1 || {
-        log "ERROR" "镜像拉取失败，尝试使用备用镜像源..."
-        docker pull registry.cn-hangzhou.aliyuncs.com/jinnrry/pmail:latest >/dev/null 2>&1 || {
+    # 拉取镜像（带重试）
+    if ! pull_image_with_retry "ghcr.io/jinnrry/pmail:latest"; then
+        log "WARN" "主镜像拉取失败，尝试阿里云镜像..."
+        sed -i 's|ghcr.io/jinnrry/pmail|registry.cn-hangzhou.aliyuncs.com/jinnrry/pmail|' docker-compose.yml
+        pull_image_with_retry "registry.cn-hangzhou.aliyuncs.com/jinnrry/pmail:latest" || {
             log "ERROR" "无法获取PMail镜像"
             exit 1
         }
-        sed -i 's|ghcr.io/jinnrry/pmail|registry.cn-hangzhou.aliyuncs.com/jinnrry/pmail|' docker-compose.yml
-    }
+    fi
 
     # 启动服务
-    log "DEBUG" "启动PMail容器..."
     docker-compose up -d >/dev/null
     
     # 等待服务就绪
-    local timeout=120
-    while ! docker inspect --format '{{.State.Health.Status}}' pmail 2>/dev/null | grep -q 'healthy'; do
-        sleep 5
-        timeout=$((timeout-5))
-        if [[ $timeout -le 0 ]]; then
-            log "ERROR" "PMail启动超时"
-            docker-compose logs
-            exit 1
-        fi
-        log "DEBUG" "等待服务就绪... (剩余${timeout}秒)"
-    done
-    
+    wait_for_service 120 "PMail服务" "docker inspect --format '{{.State.Health.Status}}' pmail | grep -q healthy"
     log "INFO" "PMail服务部署完成"
 }
 
-# 配置PMail基础设置
-configure_pmail() {
-    local ip=$1 domain=$2 password=$3
-    log "INFO" "配置PMail基础设置..."
-    
-    # 设置管理员密码
-    curl -X POST "http://$ip/api/setup" \
-        -H "Content-Type: application/json" \
-        -d "{\"action\":\"set\",\"step\":\"password\",\"account\":\"admin\",\"password\":\"$password\"}" >/dev/null 2>&1 || {
-        log "WARN" "密码设置API调用失败"
-    }
-
-    # 配置域名
-    curl -X POST "http://$ip/api/setup" \
-        -H "Content-Type: application/json" \
-        -d "{\"action\":\"set\",\"step\":\"domain\",\"web_domain\":\"mail.$domain\",\"smtp_domain\":\"$domain\"}" >/dev/null 2>&1 || {
-        log "WARN" "域名设置API调用失败"
-    }
+pull_image_with_retry() {
+    local image=$1 retries=3 wait_seconds=5
+    for ((i=1; i<=retries; i++)); do
+        if docker pull "$image" >/dev/null 2>&1; then
+            return 0
+        fi
+        log "WARN" "镜像拉取失败 (尝试 $i/$retries)"
+        [[ $i -lt $retries ]] && sleep $wait_seconds
+    done
+    return 1
 }
 
-# 配置DNS记录
+# ==================== 阿里云DNS配置 ====================
+configure_aliyun_cli() {
+    log "INFO" "配置阿里云CLI..."
+    
+    if ! command_exists aliyun; then
+        log "DEBUG" "安装阿里云CLI..."
+        curl -fsSL "https://aliyuncli.alicdn.com/aliyun-cli-linux-$ALIYUN_CLI_VERSION-amd64.tgz" | \
+            tar xz -C /usr/local/bin && chmod +x /usr/local/bin/aliyun
+    fi
+    
+    aliyun configure set \
+        --profile PMailInstaller \
+        --mode AK \
+        --access-key-id "$ACCESS_KEY" \
+        --access-key-secret "$ACCESS_SECRET" \
+        --region cn-hangzhou >/dev/null 2>&1
+    
+    # 验证配置
+    if ! aliyun sts GetCallerIdentity >/dev/null 2>&1; then
+        log "ERROR" "阿里云API认证失败"
+        exit 1
+    fi
+    log "INFO" "阿里云CLI配置完成"
+}
+
 configure_dns() {
     log "INFO" "开始配置DNS记录..."
     
     # 获取DNS配置
     local dns_config
-    dns_config=$(curl -sS "http://$PMAIL_IP/api/setup" \
-        -H "Content-Type: application/json" \
-        -d '{"action":"get","step":"dns"}') || {
+    dns_config=$(get_dns_config) || {
         log "ERROR" "获取DNS配置失败"
         return 1
     }
 
     # 处理每条记录
+    process_dns_records "$dns_config"
+    
+    # 验证记录数量
+    verify_dns_record_count "$DOMAIN"
+    
+    # 等待DNS传播
+    log "INFO" "等待DNS记录生效 (${DNS_WAIT_TIME}秒)..."
+    sleep "$DNS_WAIT_TIME"
+}
+
+get_dns_config() {
+    local retries=3 wait_seconds=2
+    for ((i=1; i<=retries; i++)); do
+        if config=$(curl -sS "http://$PMAIL_IP/api/setup" \
+            -H "Content-Type: application/json" \
+            -d '{"action":"get","step":"dns"}'); then
+            echo "$config"
+            return 0
+        fi
+        log "WARN" "获取DNS配置失败 (尝试 $i/$retries)"
+        [[ $i -lt $retries ]] && sleep $wait_seconds
+    done
+    return 1
+}
+
+process_dns_records() {
+    local dns_config=$1
     echo "$dns_config" | jq -r '
         .data | to_entries[] | 
         "\(.key) \(.value | to_entries[] | .value.host) \(.value | to_entries[] | .value.type) \(.value | to_entries[] | .value.value)"
@@ -245,44 +279,114 @@ configure_dns() {
         local priority=5
         [[ "$type" == "MX" ]] && priority=10
         
-        # 删除旧记录
-        if ! aliyun alidns DeleteSubDomainRecords \
-            --DomainName "$domain" \
-            --RR "$host" \
-            --Type "$type" \
-            --profile PMailInstaller \
-            --region cn-hangzhou >/dev/null 2>&1; then
-            log "WARN" "删除旧记录失败: $host.$domain $type"
+        if ! manage_dns_record "$domain" "$host" "$type" "$value" "$priority"; then
+            log "ERROR" "记录设置失败: $host.$domain $type"
         fi
-
-        # 添加新记录
-        if ! aliyun alidns AddDomainRecord \
-            --DomainName "$domain" \
-            --RR "$host" \
-            --Type "$type" \
-            --Value "$value" \
-            --TTL 600 \
-            --Priority "$priority" \
-            --profile PMailInstaller \
-            --region cn-hangzhou >/dev/null 2>&1; then
-            log "ERROR" "添加记录失败: $host.$domain $type"
-            continue
-        fi
-        
-        log "DEBUG" "成功设置: $host.$domain $type -> $value"
     done
-    
-    # 等待DNS传播
-    log "INFO" "等待DNS记录生效(60秒)..."
-    sleep 60
 }
 
-# 验证安装结果
+manage_dns_record() {
+    local domain=$1 host=$2 type=$3 value=$4 priority=$5
+    local delete_cmd="aliyun alidns DeleteSubDomainRecords \
+        --DomainName \"$domain\" \
+        --RR \"$host\" \
+        --Type \"$type\" \
+        --profile PMailInstaller \
+        --region cn-hangzhou"
+    
+    local add_cmd="aliyun alidns AddDomainRecord \
+        --DomainName \"$domain\" \
+        --RR \"$host\" \
+        --Type \"$type\" \
+        --Value \"$value\" \
+        --TTL 600 \
+        --Priority \"$priority\" \
+        --profile PMailInstaller \
+        --region cn-hangzhou"
+    
+    # 删除旧记录 (允许失败)
+    if ! eval "$delete_cmd" >/dev/null 2>&1; then
+        log "DEBUG" "无旧记录可删除: $host.$domain $type"
+    fi
+    
+    # 添加新记录 (带重试)
+    if ! run_with_retry "$add_cmd" "添加DNS记录"; then
+        return 1
+    fi
+    return 0
+}
+
+verify_dns_record_count() {
+    local domain=$1
+    local record_count
+    
+    record_count=$(aliyun alidns DescribeDomainRecords \
+        --DomainName "$domain" \
+        --profile PMailInstaller \
+        --region cn-hangzhou | jq '.DomainRecords.Record | length')
+    
+    if [[ $record_count -ge $REQUIRED_DNS_RECORDS ]]; then
+        log "INFO" "DNS记录验证通过 (共 $record_count 条)"
+    else
+        log "WARN" "DNS记录不足 (当前 $record_count 条，需要 $REQUIRED_DNS_RECORDS 条)"
+    fi
+}
+
+# ==================== 通用函数 ====================
+wait_for_service() {
+    local timeout=$1 service=$2 condition=$3
+    local elapsed=0 interval=5
+    
+    log "DEBUG" "等待 $service 就绪..."
+    while ! eval "$condition" 2>/dev/null; do
+        sleep $interval
+        elapsed=$((elapsed + interval))
+        
+        if [[ $elapsed -ge $timeout ]]; then
+            log "ERROR" "$service 启动超时 (${timeout}秒)"
+            return 1
+        fi
+    done
+}
+
+run_with_retry() {
+    local cmd=$1 desc=${2:-"命令"} retries=3 wait_seconds=2
+    for ((i=1; i<=retries; i++)); do
+        if eval "$cmd" >/dev/null 2>&1; then
+            return 0
+        fi
+        log "WARN" "$desc 失败 (尝试 $i/$retries)"
+        [[ $i -lt $retries ]] && sleep $wait_seconds
+    done
+    return 1
+}
+
+# ==================== PMail配置 ====================
+configure_pmail() {
+    local ip=$1 domain=$2 password=$3
+    log "INFO" "配置PMail基础设置..."
+    
+    # 设置密码
+    if ! run_with_retry \
+        "curl -X POST 'http://$ip/api/setup' -H 'Content-Type: application/json' -d '{\"action\":\"set\",\"step\":\"password\",\"account\":\"admin\",\"password\":\"$password\"}'" \
+        "设置管理员密码"; then
+        log "WARN" "密码设置失败"
+    fi
+
+    # 配置域名
+    if ! run_with_retry \
+        "curl -X POST 'http://$ip/api/setup' -H 'Content-Type: application/json' -d '{\"action\":\"set\",\"step\":\"domain\",\"web_domain\":\"mail.$domain\",\"smtp_domain\":\"$domain\"}'" \
+        "配置域名"; then
+        log "WARN" "域名配置失败"
+    fi
+}
+
+# ==================== 安装验证 ====================
 verify_installation() {
     log "INFO" "验证安装结果..."
     
     # 检查容器状态
-    if ! docker ps --filter "name=pmail" --format '{{.Status}}' | grep -q 'Up'; then
+    if ! docker inspect -f '{{.State.Running}}' pmail 2>/dev/null | grep -q 'true'; then
         log "ERROR" "PMail容器未运行"
         return 1
     fi
@@ -296,10 +400,33 @@ verify_installation() {
     done
     
     log "INFO" "所有服务验证通过"
+    return 0
 }
 
-# 显示安装结果
-show_result() {
+# ==================== 输出函数 ====================
+show_header() {
+    clear
+    echo -e "${GREEN}════════════════ PMail 自动化安装脚本 ════════════════${NC}"
+    echo -e "版本: 3.0.0 | 作者: 智能运维助手"
+    echo -e "开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo -e "${GREEN}═════════════════════════════════════════════════════${NC}\n"
+}
+
+show_footer() {
+    local status=$1
+    case $status in
+        "成功") color=$GREEN ;;
+        "失败") color=$RED ;;
+        *) color=$YELLOW ;;
+    esac
+    
+    echo -e "\n${color}════════════════ 安装结果: $status ════════════════${NC}"
+    echo -e "完成时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo -e "详细日志: ${LOG_FILE}"
+    echo -e "${color}═════════════════════════════════════════════════════${NC}\n"
+}
+
+show_summary() {
     cat <<EOF
 
 ${GREEN}════════════════ PMail 安装完成 ════════════════${NC}
@@ -313,7 +440,11 @@ A记录:      mail.${DOMAIN} → ${PMAIL_IP}
 MX记录:     ${DOMAIN} → mail.${DOMAIN} (优先级10)
 TXT记录:    ${DOMAIN} → v=spf1 a mx ~all
 
-${GREEN}安装日志已保存到: ${LOG_FILE}${NC}
+${GREEN}════════════ 安装验证 ════════════${NC}
+1. 访问管理面板检查是否正常
+2. 执行命令检查服务状态: docker ps
+3. 检查邮件收发功能
+4. 查看完整日志: less ${LOG_FILE}
 EOF
 }
 
@@ -325,41 +456,35 @@ main() {
         exit 1
     fi
 
-    readonly PMAIL_IP=$1
-    readonly DOMAIN=$2
-    readonly PASSWORD=$3
-    readonly ACCESS_KEY=$4
-    readonly ACCESS_SECRET=$5
+    readonly PMAIL_IP=$1 DOMAIN=$2 PASSWORD=$3 ACCESS_KEY=$4 ACCESS_SECRET=$5
 
-    # 初始化日志
-    mkdir -p "$(dirname "$LOG_FILE")"
-    echo "=== PMail 安装日志 ===" > "$LOG_FILE"
-    log "INFO" "开始PMail安装流程 (版本: 2.1.0)"
+    # 初始化
+    check_root
+    check_os
+    init_log
+    show_header
 
-    # 执行安装步骤
+    # 安装流程
     clean_environment
     install_dependencies
-    
-    # 检查端口
-    log "INFO" "检查端口占用情况..."
-    for port in "${REQUIRED_PORTS[@]}"; do
-        check_port "$port"
-    done
-    
-    setup_aliyun_cli
+    check_ports
+    configure_aliyun_cli
     deploy_pmail
     configure_pmail "$PMAIL_IP" "$DOMAIN" "$PASSWORD"
     configure_dns
-    verify_installation
     
-    # 设置主机名
-    hostnamectl set-hostname "mail.$DOMAIN" >/dev/null 2>&1 || {
-        log "WARN" "主机名设置失败"
-    }
-
-    show_result
-    log "INFO" "PMail安装成功完成"
-    exit 0
+    # 验证和收尾
+    if verify_installation; then
+        hostnamectl set-hostname "mail.$DOMAIN" >/dev/null 2>&1 || true
+        show_summary
+        show_footer "成功"
+        log "INFO" "PMail安装成功完成"
+        exit 0
+    else
+        show_footer "失败"
+        log "ERROR" "PMail安装验证失败"
+        exit 1
+    fi
 }
 
 main "$@"
