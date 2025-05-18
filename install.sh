@@ -76,7 +76,7 @@ install_docker() {
         else
             echo -e "${YELLOW}⚠ 安装命令失败，尝试备用方案...${NC}"
             sleep 2
-        fi
+        done
     done
 
     # 启动服务
@@ -233,9 +233,103 @@ start_pmail() {
     done
 }
 
+# 阿里云DNS解析配置（带频率控制）
+configure_aliyun_dns() {
+    echo -e "${BLUE}[8/10] 配置阿里云DNS解析...${NC}"
+    
+    # 配置阿里云CLI
+    aliyun configure set \
+        --profile PMailInstaller \
+        --mode AK \
+        --access-key-id "$ACCESS_KEY" \
+        --access-key-secret "$ACCESS_SECRET" \
+        --region cn-hangzhou > /dev/null 2>&1
+
+    # 验证API连接
+    if ! aliyun sts GetCallerIdentity > /dev/null 2>&1; then
+        echo -e "${RED}✘ 阿里云API认证失败${NC}"
+        return 1
+    fi
+
+    # 获取当前DNS记录
+    local existing_records
+    existing_records=$(aliyun alidns DescribeDomainRecords \
+        --DomainName "$DOMAIN" \
+        --PageSize 500)
+
+    # 获取PMail需要的DNS配置
+    local dns_config
+    dns_config=$(curl -sS "http://${PMAIL_IP}/api/setup" \
+        -H "Content-Type: application/json" \
+        -d '{"action":"get","step":"dns"}')
+
+    # 频率控制参数
+    local -i max_retries=3
+    local -i delay_seconds=2
+    local -i rate_limit=5  # 每分钟最大请求数
+    local -i last_request=0
+
+    echo "$dns_config" | jq -r '
+        .data | keys[] as $domain |
+        .[$domain] | to_entries[] | 
+        "\($domain) \(.value.host) \(.value.type) \(.value.value)"
+    ' | while read -r domain host type value; do
+
+        # 速率控制（每分钟不超过$rate_limit次请求）
+        local -i now=$(date +%s)
+        local -i elapsed=$((now - last_request))
+        if (( elapsed < 60/rate_limit )); then
+            sleep $((60/rate_limit - elapsed))
+        fi
+
+        # 检查记录是否已存在
+        if echo "$existing_records" | jq -e \
+            --arg h "$host" \
+            --arg t "$type" \
+            --arg v "$value" \
+            '.DomainRecords.Record[] | select(.RR==$h and .Type==$t and .Value==$v)' > /dev/null; then
+            echo -e "${GREEN}✔ 记录已存在: ${host}.${domain} ${type} ${value}${NC}"
+            continue
+        fi
+
+        # 重试机制
+        local -i attempt=0
+        while (( attempt < max_retries )); do
+            ((attempt++))
+            
+            # 删除可能存在的旧记录
+            echo -e "${YELLOW}▶ 尝试 ${attempt}/${max_retries}: 更新 ${host}.${domain} ${type}...${NC}"
+            aliyun alidns DeleteSubDomainRecords \
+                --DomainName "$domain" \
+                --RR "$host" \
+                --Type "$type" > /dev/null 2>&1 || true
+
+            # 添加新记录
+            if aliyun alidns AddDomainRecord \
+                --DomainName "$domain" \
+                --RR "$host" \
+                --Type "$type" \
+                --Value "$value" \
+                --TTL 600 > /dev/null 2>&1; then
+                
+                echo -e "${GREEN}✔ 成功设置: ${host}.${domain} ${type} ${value}${NC}"
+                last_request=$(date +%s)
+                break
+            else
+                sleep "$delay_seconds"
+                delay_seconds=$((delay_seconds * 2)) # 指数退避
+            fi
+        done
+
+        if (( attempt >= max_retries )); then
+            echo -e "${RED}✘ 无法设置: ${host}.${domain} ${type} ${value}${NC}"
+        fi
+    done
+}
+
 # 配置PMail设置
 configure_pmail() {
-    echo -e "${BLUE}[8/10] 配置PMail设置...${NC}"
+    echo -e "${BLUE}[9/10] 配置PMail设置...${NC}"
     
     local api_url="http://${PMAIL_IP}/api/setup"
     
@@ -255,12 +349,12 @@ configure_pmail() {
         -d "{\"action\":\"set\",\"step\":\"domain\",\"web_domain\":\"mail.${DOMAIN}\",\"smtp_domain\":\"${DOMAIN}\",\"multi_domain\":\"\"}" || true
     
     # 配置DNS记录
-    local dns_config
-    dns_config=$(curl -sS "$api_url" \
-        -H "Content-Type: application/json" \
-        -d '{"action":"get","step":"dns"}')
-    
-    echo "$dns_config" | jq || true
+    configure_aliyun_dns || {
+        echo -e "${YELLOW}⚠ 阿里云DNS自动配置失败，请手动添加以下记录：${NC}"
+        curl -sS "$api_url" \
+            -H "Content-Type: application/json" \
+            -d '{"action":"get","step":"dns"}' | jq
+    }
     
     # 配置SSL
     curl -X POST "$api_url" \
@@ -270,13 +364,13 @@ configure_pmail() {
 
 # 设置主机名
 set_hostname() {
-    echo -e "${BLUE}[9/10] 设置主机名...${NC}"
+    echo -e "${BLUE}[10/10] 设置主机名...${NC}"
     hostnamectl set-hostname "smtp.${DOMAIN}" || true
 }
 
 # 最终验证
 final_validation() {
-    echo -e "${BLUE}[10/10] 最终验证...${NC}"
+    echo -e "${BLUE}[11/10] 最终验证...${NC}"
     
     echo -e "${YELLOW}▶ 检查Docker容器状态:${NC}"
     docker ps -a
