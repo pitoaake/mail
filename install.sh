@@ -1,280 +1,186 @@
 #!/bin/bash
 
-# 权限校验（需root权限）
-if [[ $EUID -ne 0 ]]; then
-    echo -e "\033[31m错误：必须使用root权限运行此脚本\033[0m" >&2
-    exit 1
-fi
+# 全局配置
+set -euo pipefail
+shopt -s inherit_errexit
+
+# 颜色定义
+RED='\033[31m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+BLUE='\033[36m'
+NC='\033[0m'
+
+# 依赖项版本
+DOCKER_COMPOSE_VERSION="v2.24.7"
+ALIYUN_CLI_VERSION="3.0.277"
+JQ_VERSION="1.6"
 
 # 参数校验
-if [[ $# -lt 5 ]]; then
-    echo -e "\033[31m错误：缺少必要参数\033[0m"
-    echo "用法: install.sh <IP地址> <域名> <密码> <ACCECSS_KEY> <ACCECSS_SECRET>"
-    exit 1
-fi
-
-# 添加Docker官方源前增加文件检测
-DOCKER_KEYRING="/usr/share/keyrings/docker-archive-keyring.gpg"
-CLOUD_REGION="ap-northeast-1"
-
-PMAIL_IP=$1
-DOMAIN=$2
-PASSWORD=$3
-ACCECSS_KEY=$4
-ACCECSS_SECRET=$5
-
-# 检测Docker是否已安装
-check_docker_installed() {
-    echo -e "\033[32m[依赖检测] Docker\033[0m"
-    if command -v docker &>/dev/null; then
-        docker_version=$(docker --version | awk '{print $3}' | tr -d ',')
-        echo -e "\033[32m ✔  Docker已安装 (版本：$docker_version)\033[0m"
-        return 0
-    else
-        echo -e "\033[33m ✘ Docker未安装\033[0m"
-        return 1
-    fi
-}
-
-check_aliyun_cli_installed() {
-    echo -e "\033[32m[依赖检测] Aliyun CLI\033[0m"
-    if command -v aliyun &>/dev/null; then
-        aliyun_cli_version=$(aliyun version)
-        echo -e "\033[32m ✔  Aliyun CLI已安装 (版本：$aliyun_cli_version)\033[0m"
-        return 0
-    else
-        echo -e "\033[33m ✘ Aliyun CLI未安装\033[0m"
-        return 1
-    fi
-}
-
-install_docker() {
-    # 安装依赖
-    echo "开始安装系统依赖..."
-    if grep -q "ubuntu" /etc/os-release; then
-       apt-get update -y -qq 
-       DEBIAN_FRONTEND=noninteractive apt-get install -y -qq apt-transport-https ca-certificates curl gnupg 
-    elif grep -q "centos" /etc/os-release; then
-        yum install -y -q yum-utils device-mapper-persistent-data lvm2 
-    fi
-
-    # 添加Docker官方源
-    echo " 配置Docker仓库..."
-    if [ ! -f "$DOCKER_KEYRING" ]; then
-        echo " 正在下载Docker GPG密钥..."
-        MIRROR_URLS=(
-            "https://download.docker.com/linux/ubuntu/gpg"
-            "https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg"
-            "https://mirrors.cloud.tencent.com/docker-ce/linux/ubuntu/gpg"
-        )
-        
-        for url in "${MIRROR_URLS[@]}"; do
-            if curl -fsSL "$url" | sudo gpg --dearmor -o "$DOCKER_KEYRING"; then
-                echo " GPG密钥下载成功"
-                break
-            else
-                echo " 镜像源 $url 下载失败，尝试下一个..." >&2
-                sleep 2
-            fi
-        done
-    else
-        echo -e "\033[33m 检测到GPG密钥已存在，跳过下载\033[0m"
-    fi
-
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-    # 安装Docker引擎
-    echo " 开始安装Docker..."
-    if grep -q "ubuntu" /etc/os-release; then
-        apt-get update -y
-        apt-get install -y docker-ce docker-ce-cli containerd.io
-    elif grep -q "centos" /etc/os-release; then
-        yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-        yum install -y docker-ce docker-ce-cli containerd.io
-    fi
-
-    # 启动服务
-    systemctl start docker
-    systemctl enable docker
-}
-
-post_install() {
-    # 配置镜像加速
-    echo -e "\033[33m 配置镜像加速...\033[0m"
-    mkdir -p /etc/docker
-    cat > /etc/docker/daemon.json << EOF
-{
-  "registry-mirrors": ["https://registry.docker-cn.com"],
-  "exec-opts": ["native.cgroupdriver=systemd"]
-}
-EOF
-
-    # 配置用户组
-    usermod -aG docker $SUDO_USER
-    echo -e "\033[33m 提示：当前用户已加入docker组\033[0m"
-
-    # 重启服务
-    echo -e "\033[33m 等待Docker重启...\033[0m"
-    systemctl daemon-reload
-    systemctl restart docker
-
-    # 验证安装
-    if docker run --rm hello-world &>/dev/null; then
-        echo -e "\033[32m ✔ Docker安装验证通过\033[0m"
-    else
-        echo -e "\033[31m ✘ Docker安装验证失败\033[0m" >&2
+validate_parameters() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}错误：必须使用root权限运行此脚本${NC}" >&2
         exit 1
     fi
-    docker_version=$(docker --version | awk '{print $3}' | tr -d ',')
-    echo -e "\n\033[36m[操作完成]！Docker安装完成 (版本：$docker_version)\033[0m"
+
+    if [[ $# -lt 5 ]]; then
+        echo -e "${RED}错误：缺少必要参数${NC}"
+        echo "用法: install.sh <IP地址> <域名> <密码> <ACCESS_KEY> <ACCESS_SECRET>"
+        exit 1
+    fi
+
+    PMAIL_IP=$1
+    DOMAIN=$2
+    PASSWORD=$3
+    ACCESS_KEY=$4
+    ACCESS_SECRET=$5
 }
 
-check_docker_compose() {
-    echo -e "\033[32m[依赖检测] Docker Compose\033[0m"
-    if command -v docker-compose &> /dev/null || docker compose version &> /dev/null; then
-        echo -e "\033[32m ✔ Docker Compose已安装\033[0m"
-        return 0
+# 安装基础依赖
+install_basic_deps() {
+    echo -e "${BLUE}[1/10] 安装系统基本依赖...${NC}"
+    
+    local pkgs=("curl" "wget" "gnupg" "ca-certificates")
+    if grep -qi "ubuntu" /etc/os-release; then
+        apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" apt-transport-https
+    elif grep -qi "centos" /etc/os-release; then
+        yum install -y "${pkgs[@]}" yum-utils
     else
-        echo -e "\033[33m ✘ Docker Compose未安装\033[0m"
-        return 1
+        echo -e "${YELLOW}⚠ 不支持的Linux发行版，尝试继续安装...${NC}"
     fi
 }
 
-install_docker_compose() {
-    echo "开始安装Docker Compose..."
-    COMPOSE_VERSION="v2.20.5"
-    BINARY_NAME="docker-compose-$(uname -s)-$(uname -m)"
-    INSTALL_PATH="/usr/local/bin/docker-compose"
+# Docker安装（多源备用）
+install_docker() {
+    echo -e "${BLUE}[2/10] 安装Docker引擎...${NC}"
     
-    # 定义多个下载源（包括官方和国内镜像）
-    MIRROR_URLS=(
-        "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/${BINARY_NAME}"
-        "https://mirror.ghproxy.com/https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/${BINARY_NAME}"
-        "https://download.fastgit.org/docker/compose/releases/download/${COMPOSE_VERSION}/${BINARY_NAME}"
+    if command -v docker &>/dev/null; then
+        local docker_version
+        docker_version=$(docker --version | awk '{print $3}' | tr -d ',')
+        echo -e "${GREEN}✔ Docker已安装 (版本: ${docker_version})${NC}"
+        return 0
+    fi
+
+    # 多源安装Docker
+    local docker_install_cmds=(
+        "curl -fsSL https://get.docker.com | sh -"
+        "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg"
+        "echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable\" | tee /etc/apt/sources.list.d/docker.list > /dev/null"
     )
-    
-    # 尝试从多个源下载
-    for url in "${MIRROR_URLS[@]}"; do
-        echo "尝试从 $url 下载..."
-        if curl -sSL "$url" -o "$INSTALL_PATH" --connect-timeout 30; then
-            echo "下载成功"
+
+    for cmd in "${docker_install_cmds[@]}"; do
+        if eval "$cmd"; then
+            echo -e "${GREEN}✔ Docker安装步骤成功${NC}"
             break
         else
-            echo "下载失败，尝试下一个镜像源..."
-            rm -f "$INSTALL_PATH" 2>/dev/null
+            echo -e "${YELLOW}⚠ 安装命令失败，尝试备用方案...${NC}"
             sleep 2
         fi
     done
-    
-    # 检查是否下载成功
-    if [ ! -f "$INSTALL_PATH" ]; then
-        echo -e "\033[31m ✘ 无法从任何镜像源下载 Docker Compose\033[0m" >&2
+
+    # 启动服务
+    systemctl enable --now docker
+    docker run --rm hello-world &>/dev/null || {
+        echo -e "${RED}✘ Docker安装验证失败${NC}"
         exit 1
-    fi
-    
-    # 设置权限
-    chmod +x "$INSTALL_PATH"
-    ln -sf "$INSTALL_PATH" /usr/bin/docker-compose
-    
-    # 验证安装
-    if docker-compose --version &>/dev/null; then
-        echo -e "\033[32m ✔ Docker Compose安装验证通过\033[0m"
-        return 0
-    else
-        echo -e "\033[31m ✘ Docker Compose安装验证失败\033[0m" >&2
-        exit 1
-    fi
+    }
 }
 
-check_and_install_jq() {
-    echo -e "\033[32m[依赖检测] jq\033[0m"
-    if command -v jq &> /dev/null; then
-        echo -e "\033[32m ✔ jq已安装 $(jq --version)\033[0m"
-        return 0
-    fi
-
-    echo -e "\033[33m ✘ jq未安装\033[0m"
-    echo -e "\033[33m 开始安装 jq 工具...\033[0m"
+# Docker Compose安装（多源备用）
+install_docker_compose() {
+    echo -e "${BLUE}[3/10] 安装Docker Compose...${NC}"
     
-    if [[ -f /etc/redhat-release ]]; then
-        sudo yum install -q -y epel-release && sudo yum install -q -y jq
-    elif [[ -f /etc/lsb-release ]] || [[ -f /etc/debian_version ]]; then
-        sudo apt-get update -qq && sudo apt-get install -qq -y jq
-    else
-        tmp_dir="/tmp/jq_install_$(date +%s)"
-        mkdir -p "$tmp_dir"
-        curl -sSL https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64 -o "$tmp_dir/jq"
-        chmod +x "$tmp_dir/jq"
-        export PATH="$tmp_dir:$PATH"
-    fi
+    local compose_bin="/usr/local/bin/docker-compose"
+    local mirror_urls=(
+        "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)"
+        "https://mirror.ghproxy.com/https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)"
+        "https://download.fastgit.org/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)"
+    )
 
-    if ! command -v jq &> /dev/null; then
-        echo -e "\033[31m ✘ jq安装失败！\033[0m" >&2
+    for url in "${mirror_urls[@]}"; do
+        echo -e "${YELLOW}尝试从 ${url} 下载...${NC}"
+        if curl -L "$url" -o "$compose_bin"; then
+            chmod +x "$compose_bin"
+            ln -sf "$compose_bin" /usr/bin/docker-compose
+            break
+        fi
+    done
+
+    docker-compose --version &>/dev/null || {
+        echo -e "${RED}✘ Docker Compose安装失败${NC}"
         exit 1
-    fi
-    echo -e "\033[32m ✔jq 安装成功 $(jq --version)\033[0m"
+    }
 }
 
-##################################################
-# 主安装流程
-if check_docker_installed; then
-    echo " 跳过安装步骤，直接使用现有Docker环境"
-else
-    install_docker
-    post_install
-fi
-
-if check_docker_compose; then
-    echo " 跳过安装步骤，开始配置环境..."
-else
-    install_docker_compose
-fi
-
-# 强制刷新用户组
-if grep -q docker /etc/group; then
-    echo -e "\033[33m 正在激活docker组权限...\033[0m"
-    newgrp docker <<EOF
-    echo " 权限已激活"
-EOF
-fi
-
-if check_aliyun_cli_installed; then
-    echo " 跳过安装步骤，直接使用现有Aliyun CLI环境"
-else
-    # 安装aliyun cli
-    echo " 开始安装Aliyun CLI..."
-    tmp_dir="/tmp/aliyun_install_$(date +%s)"
-    mkdir -p "$tmp_dir"
-    curl -sSL "https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz?spm=a2c4g.11186623.0.0.5893478dPU6YhK&file=aliyun-cli-linux-latest-amd64.tgz" -o "$tmp_dir/aliyun-cli-linux-latest-amd64.tgz"
-    cd "$tmp_dir" && tar xzvf aliyun-cli-linux-latest-amd64.tgz
-    echo "export PATH=\$PATH:$tmp_dir" >> ~/.bash_profile
-    source ~/.bash_profile
-
-    # 验证安装
+# 安装Aliyun CLI
+install_aliyun_cli() {
+    echo -e "${BLUE}[4/10] 安装Aliyun CLI...${NC}"
+    
     if command -v aliyun &>/dev/null; then
-        aliyun_cli_version=$(aliyun version)
-        echo -e "\033[32m ✔ Aliyun CLI安装验证通过 (版本：$aliyun_cli_version)\033[0m"
-        aliyun configure set \
-          --profile AkProfile1 \
-          --mode AK \
-          --access-key-id $ACCECSS_KEY \
-          --access-key-secret $ACCECSS_SECRET \
-          --region $CLOUD_REGION
-    else
-        echo -e "\033[31m ✘ Aliyun CLI安装失败\033[0m" >&2
-        exit 1
+        echo -e "${GREEN}✔ Aliyun CLI已安装${NC}"
+        return 0
     fi
-fi
 
-check_and_install_jq
-##########################################################################
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    trap 'rm -rf "$tmp_dir"' EXIT
 
-echo -e "\n\033[36m开始生成PMail配置文件...\033[0m"
-mkdir -p ~/pmail/{config,ssl} && cd ~/pmail
+    local mirror_urls=(
+        "https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz"
+        "https://mirrors.aliyun.com/aliyun-cli/aliyun-cli-linux-latest-amd64.tgz"
+    )
 
-# 自动生成docker-compose.yml
-echo " 生成PMail docker文件"
-cat << EOF > docker-compose.yml
+    for url in "${mirror_urls[@]}"; do
+        if curl -fsSL "$url" -o "$tmp_dir/aliyun-cli.tgz"; then
+            tar xzf "$tmp_dir/aliyun-cli.tgz" -C "$tmp_dir"
+            mv "$tmp_dir/aliyun" /usr/local/bin/
+            chmod +x /usr/local/bin/aliyun
+            break
+        fi
+    done
+
+    aliyun --version &>/dev/null || {
+        echo -e "${RED}✘ Aliyun CLI安装失败${NC}"
+        exit 1
+    }
+}
+
+# 安装jq
+install_jq() {
+    echo -e "${BLUE}[5/10] 安装jq工具...${NC}"
+    
+    if command -v jq &>/dev/null; then
+        echo -e "${GREEN}✔ jq已安装${NC}"
+        return 0
+    fi
+
+    if grep -qi "ubuntu" /etc/os-release; then
+        apt-get install -y jq
+    elif grep -qi "centos" /etc/os-release; then
+        yum install -y jq
+    else
+        local tmp_dir
+        tmp_dir=$(mktemp -d)
+        curl -fsSL "https://github.com/stedolan/jq/releases/download/jq-${JQ_VERSION}/jq-linux64" -o "$tmp_dir/jq"
+        chmod +x "$tmp_dir/jq"
+        mv "$tmp_dir/jq" /usr/local/bin/
+    fi
+
+    jq --version &>/dev/null || {
+        echo -e "${RED}✘ jq安装失败${NC}"
+        exit 1
+    }
+}
+
+# 配置PMail环境
+setup_pmail() {
+    echo -e "${BLUE}[6/10] 配置PMail环境...${NC}"
+    
+    mkdir -p ~/pmail/{config,ssl}
+    cd ~/pmail
+
+    cat > docker-compose.yml <<EOF
 version: '3.9'
 services:
   pmail:
@@ -283,186 +189,122 @@ services:
     environment:
       - TZ=Asia/Shanghai
     ports:
-      - "25:25"                # SMTP标准端口
-      - "465:465"              # SMTPS加密端口
-      - "80:80"                # Web管理界面
-      - "443:443"              # HTTPS访问端口
+      - "25:25"
+      - "465:465"
+      - "80:80"
+      - "443:443"
       - "995:995"
       - "993:993"
-    restart: unless-stopped    # 异常退出自动重启
+    restart: unless-stopped
+    volumes:
+      - ./config:/work/config
+      - ./ssl:/work/ssl
 EOF
-echo " PMail配置完成"
 
-echo -e "\n\033[33m停止并删除PMail服务...\033[0m"
-if command -v docker-compose &>/dev/null; then
-    docker-compose down
-elif command -v docker &>/dev/null && docker compose version &>/dev/null; then
-    docker compose down
-fi
+    # 停止并删除旧容器
+    docker-compose down || true
+    docker ps -aq | xargs -r docker rm -f
+}
 
-docker ps -aq | xargs -r docker rm -f
-docker ps -a
-docker network list
-netstat -anpto | grep 25
+# 启动PMail服务
+start_pmail() {
+    echo -e "${BLUE}[7/10] 启动PMail服务...${NC}"
+    
+    if ! docker-compose up -d; then
+        echo -e "${RED}✘ PMail启动失败${NC}"
+        docker-compose logs
+        exit 1
+    fi
 
-echo -e "\n\033[36m安装并启动PMail服务...\033[0m"
-if command -v docker-compose &>/dev/null; then
-    docker-compose up -d
-elif command -v docker &>/dev/null && docker compose version &>/dev/null; then
-    docker compose up -d
-else
-    echo -e "\033[31m错误：未找到可用的Docker Compose命令\033[0m" >&2
-    exit 1
-fi
-
-if [ $? -eq 0 ]; then
-    echo -e "\033[33mPMail启动成功！\033[0m"
-else
-    echo -e "\033[31mPMail启动失败，请检查日志\033[0m" >&2
-    exit 1
-fi
-
-ping_pmail_service(){
-    URL="$1";
-    TIMEOUT=60
-    INTERVAL=5
-
-    start_time=$(date +%s)
-    while true; do
-        http_code=$(curl -sIL -w "%{http_code}" -m 5 -o /dev/null "$URL")
+    # 等待服务启动
+    local timeout=60
+    local interval=5
+    local elapsed=0
+    
+    while ! curl -fsSL "http://${PMAIL_IP}" &>/dev/null; do
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
         
-        if [[ "$http_code" =~ ^2 ]]; then
-            echo -e "\n\033[36m[$(date)] PMail 已可访问\033[0m"
-            return 0
-        fi
-        
-        current_time=$(date +%s)
-        elapsed=$((current_time - start_time))
-        
-        if [ $elapsed -ge $TIMEOUT ]; then
-            echo -e "\033[31m[$(date)] PMail超时（${TIMEOUT}秒）未访问成功，退出程序，请重新处理\033[0m"
+        if [ "$elapsed" -ge "$timeout" ]; then
+            echo -e "${RED}✘ PMail服务启动超时${NC}"
+            docker-compose logs
             exit 1
         fi
-        
-        sleep $INTERVAL
     done
 }
 
-fetch_and_process_json() {
-    if [[ $# -lt 4 ]]; then
-        echo -e "\033[31m错误：缺少必要参数\033[0m"
-        echo "用法: fetch_and_process_json <说明> <IP地址> <JSON数据> <parse模式>"
-        echo "parse模式: 1-执行阿里云解析，0-仅保存JSON"
-        return 1
-    fi
-
-    local title="$1"
-    local target_ip="$2"
-    local json_data="$3"
-    local parse_mode="$4"
-    local api_url="http://${target_ip}/api/setup"
-
-    echo -e "\n\033[36m$title\033[0m"
-    local http_response
-    http_response=$(curl -sSf -X POST \
-        -H "Accept: application/json, text/plain, */*" \
-        -H "Accept-Language: zh-CN,zh;q=0.9" \
-        -H "Connection: keep-alive" \
-        -H "Content-Type: application/json;charset=UTF-8;" \
-        -H "Lang: zhCn" \
-        -H "Origin: http://${target_ip}" \
-        -H "Referer: http://${target_ip}/" \
-        -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36" \
-        --data-raw "$json_data" \
-        --insecure \
-        "$api_url" 2>&1)
-
-    local curl_exit_code=$?
-    if [ $curl_exit_code -ne 0 ]; then
-        echo -e "\033[31m请求失败，错误代码：$curl_exit_code\033[0m"
-        echo "详细错误：$http_response"
-        return 2
-    fi
-
-    if [ "$parse_mode" -eq 1 ]; then
-        echo "$http_response" | jq -r '
-          .data | keys[] as $domain |
-          .[$domain] | to_entries | map(
-             "aliyun alidns DeleteSubDomainRecords --profile AkProfile1 --region '"$CLOUD_REGION"' " +
-             "--Type \(.value.type) " +
-             "--DomainName \"\($domain | @sh)\" " +
-              "--RR \"\(.value.host | @sh)\" " +
-             " && " +
-             "aliyun alidns AddDomainRecord --profile AkProfile1 --region '"$CLOUD_REGION"' " +
-                "--Type \(.value.type) " +
-                "--Value \"\(.value.value | @sh)\" " +
-                "--TTL 600 --Priority 1 " +
-                "--DomainName \"\($domain | @sh)\" " +
-                "--RR \"\(.value.host | @sh)\""
-          ) | join("\n")
-        ' | xargs -I{} sh -c '
-        set -e
-        max_retries=3
-        base_delay=2
-        attempt=1
-        last_exit=0
-        cmd="{}"
-        
-        GREEN="\033[32m"
-        RED="\033[31m"
-        YELLOW="\033[33m"
-        NC="\033[0m"
-        
-        until [ $attempt -gt $max_retries ]; do
-            echo "▶▶ 执行命令: $cmd (尝试 $attempt/$max_retries)"
-            
-            if eval "$cmd"; then
-                echo -e "${GREEN}✔ 阿里云DNS记录操作成功${NC}"
-                last_exit=0
-                break
-            else
-                last_exit=$?
-                case $last_exit in
-                    94|255)
-                        retry_type="可重试错误"
-                        ;;
-                    *)
-                        retry_type="致命错误"
-                        attempt=$max_retries  
-                        ;;
-                esac
-                
-                echo -e "${YELLOW}⚠ ${retry_type}[CODE:$last_exit] 将在退避后重试...${NC}"
-                sleep $((base_delay*2**(attempt-1)+RANDOM%3))
-                ((attempt++))
-            fi
-        done
-        
-        if [ $last_exit -ne 0 ]; then
-            echo -e "${RED}✖ 已达最大重试次数，最终失败！错误码：$last_exit${NC}"
-            exit $last_exit
-        fi'
-    else
-        local output_file="response_$(date +%s).json"
-        echo "$http_response" > "$output_file"
-        echo -e "\033[32m响应已保存至：$output_file\033[0m"
-    fi
-    return 0
+# 配置PMail设置
+configure_pmail() {
+    echo -e "${BLUE}[8/10] 配置PMail设置...${NC}"
+    
+    local api_url="http://${PMAIL_IP}/api/setup"
+    
+    # 配置数据库
+    curl -X POST "$api_url" \
+        -H "Content-Type: application/json" \
+        -d '{"action":"set","step":"database","db_type":"sqlite","db_dsn":"/work/./config/pmail.db"}' || true
+    
+    # 设置密码
+    curl -X POST "$api_url" \
+        -H "Content-Type: application/json" \
+        -d "{\"action\":\"set\",\"step\":\"password\",\"account\":\"admin\",\"password\":\"${PASSWORD}\"}" || true
+    
+    # 配置域名
+    curl -X POST "$api_url" \
+        -H "Content-Type: application/json" \
+        -d "{\"action\":\"set\",\"step\":\"domain\",\"web_domain\":\"mail.${DOMAIN}\",\"smtp_domain\":\"${DOMAIN}\",\"multi_domain\":\"\"}" || true
+    
+    # 配置DNS记录
+    local dns_config
+    dns_config=$(curl -sS "$api_url" \
+        -H "Content-Type: application/json" \
+        -d '{"action":"get","step":"dns"}')
+    
+    echo "$dns_config" | jq || true
+    
+    # 配置SSL
+    curl -X POST "$api_url" \
+        -H "Content-Type: application/json" \
+        -d '{"action":"set","step":"ssl","ssl_type":"0","key_path":"./config/ssl/private.key","crt_path":"./config/ssl/public.crt"}' || true
 }
 
-echo -e "\n\033[36m检测PMail服务是否正常...\033[0m"
-ping_pmail_service "http://$PMAIL_IP/"
+# 设置主机名
+set_hostname() {
+    echo -e "${BLUE}[9/10] 设置主机名...${NC}"
+    hostnamectl set-hostname "smtp.${DOMAIN}" || true
+}
 
-fetch_and_process_json "配置PMail数据库..." $PMAIL_IP '{"action":"set","step":"database","db_type":"sqlite","db_dsn":"/work/./config/pmail.db"}' 0
-ACCOUNT_DATA=$(jq -n --arg pwd "$PASSWORD" '{action: "set", step: "password", account: "admin", "password": $pwd}')
-fetch_and_process_json "配置PMail账号密码..." $PMAIL_IP "$ACCOUNT_DATA" 0
-echo -e "\n\033[36mPMail账号: admin, 密码: $PASSWORD \033[0m" 
-JSON_DATA=$(jq -n --arg web "mail.$DOMAIN" --arg smtp "$DOMAIN" '{action: "set", step: "domain", web_domain: $web, smtp_domain: $smtp, multi_domain: ""}')
-fetch_and_process_json "配置PMail域名..." $PMAIL_IP "$JSON_DATA" 0
-fetch_and_process_json "生成DNS记录..." $PMAIL_IP '{"action":"get","step":"dns"}' 1
-fetch_and_process_json "SSL配置..." $PMAIL_IP '{"action":"set","step":"ssl","ssl_type":"0","key_path":"./config/ssl/private.key","crt_path":"./config/ssl/public.crt"}' 0
+# 最终验证
+final_validation() {
+    echo -e "${BLUE}[10/10] 最终验证...${NC}"
+    
+    echo -e "${YELLOW}▶ 检查Docker容器状态:${NC}"
+    docker ps -a
+    
+    echo -e "${YELLOW}▶ 检查服务端口:${NC}"
+    netstat -tulnp | grep -E '25|80|443|465|993|995' || ss -tulnp | grep -E '25|80|443|465|993|995'
+    
+    echo -e "${YELLOW}▶ PMail登录信息:${NC}"
+    echo -e "URL: http://${PMAIL_IP}"
+    echo -e "用户名: admin"
+    echo -e "密码: ${PASSWORD}"
+    
+    echo -e "${GREEN}✔ PMail安装完成!${NC}"
+}
 
-echo -e "\n\033[36m设置hostname\033[0m"
-hostnamectl set-hostname smtp.$DOMAIN
+# 主执行流程
+main() {
+    validate_parameters "$@"
+    install_basic_deps
+    install_docker
+    install_docker_compose
+    install_aliyun_cli
+    install_jq
+    setup_pmail
+    start_pmail
+    configure_pmail
+    set_hostname
+    final_validation
+}
 
-echo -e "\n\033[32m[安装完成] PMail 已成功安装并配置\033[0m"
+main "$@"
